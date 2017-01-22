@@ -1,0 +1,923 @@
+#!/usr/bin/env python
+#
+# Volconv - geometry-aware DICOM-to-NIfTI converter
+# Front-end
+#
+# Copyright 2006-2017 Mark J White <mark@celos.net>
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# 
+# See COPYING.txt and NOTICE.txt in the distribution for details.
+# 
+
+RELEASE = "1.0.0"
+URL     = "https://bitbucket.org/mjwhite/volconv"
+
+from numpy import *
+from pydcm import *
+from nifti import *
+
+import os
+import struct
+import sys
+import re
+import subprocess
+import inspect
+
+from optparse import OptionParser
+
+ver = map(int, string.split(
+    re.sub(r'rc\d+$','',string.split(sys.version)[0]),"."))
+
+if ver < [2,4,0]:
+    from sets import Set
+    def set(x):
+        return Set(x)
+
+class VolumeError(ValueError):
+    def __init__(self):
+        pass
+
+class DicomConverter(DicomSequenceReader):
+
+    def __init__(self, options, source):
+        self.options = options
+        DicomSequenceReader.__init__(self, source, 
+                pattern=options.pattern, 
+                fnmatch=options.fnmatch,
+                fnmatch_relative=options.fnmatch_relative,
+                seqinc=options.seqinc, seqexc=options.seqexc,
+                flat=options.flat, csa=options.csa, acr=options.acr,
+                splitorient=(not options.mergeorient),
+                roundorient=options.roundorient,
+                roundorientthresh=options.roundorientthresh,
+                slice3d=options.slice3d,
+                sliceinst=options.sliceinst,
+                stackunk=options.stackunk,
+                sar=options.sar,
+                phase=options.phase,
+                single=options.single, mosaic=options.mosaic,
+                typeinc=options.typeinc, typeexc=options.typeexc,
+                nsubseries=options.nsubseries)
+        self.filenames = {}
+        self.axes = {}
+        self.show_error_eg = options.errorverb
+        self.alias = None
+
+    def Execute(self):
+        self.scanAll()
+
+        # arrange for XML index to be anonymized
+        if self.options.anonymize:
+            self.anonymize(self.options.anonymize,self.options.exdcmforce)
+
+        if self.options.exdcmpath:
+            self.exdcmpath(True)
+           
+        # build alias table (used for dump as well as output)
+        if self.options.alias:
+            self.alias = NameMatcher(self.options.alias)
+            self.alias.findMatches(self)
+
+        if self.options.xml:
+            print self.toxml(),
+        elif self.options.json:
+            print self.tojson(alias=self.alias),
+        elif self.options.debug:
+            self.dumpStudies()
+        else:
+            self.dump(self.alias)
+        
+            if not self.options.nowrite:
+
+                path = os.path.dirname(self.options.outprefix)
+                if path != "" and not os.path.isdir(path):
+                    puts("Creating output directory: %s\n"%(path,))
+                    os.makedirs(path)
+
+                try:
+                    self.WriteAll()
+                except VolumeError:
+                    pass
+
+                for s in self.options.index:
+                    if s == "xml": self.WriteIndexXML()
+                    if s == "json": self.WriteIndexJSON()
+
+    def WriteVol(self, series, study, sno, tp, echo, simplenumber):
+
+        studyno = study[0]
+        studyname = study[1]
+
+        gaps = 0
+        firstnl = "\n"
+
+        # XXX: shouldn't need numericslicelist now (need to also 
+        # float() numerictimelist, then remove complexity here)
+        slicelist = {}
+        for x in series.slices.keys():
+            slicelist[float(x)] = x
+        numericslicelist = slicelist.keys()
+        numericslicelist.sort()
+        first_slice = numericslicelist[0]
+
+        dim = (series.shape[0], series.shape[1], len(slicelist))
+        arr = zeros(dim, "Int16", order='F')
+
+        linear = reshape(arr, (dim[0]*dim[1], dim[2]), order='F')
+    
+        timelist = {}
+        for t in series.times.keys():
+            timelist[float(t)] = t
+        numerictimelist = timelist.keys()
+        numerictimelist.sort()
+
+      # for i in range(0,len(numerictimelist)-1):
+      #     print numerictimelist[i] - numerictimelist[i+1]
+      # print "Total", len(numerictimelist)
+
+        time = timelist[numerictimelist[tp]]
+
+        n = 0
+        rawdata = zeros(dim[0]*dim[1], 'Int16', order='F')
+
+        for sl in numericslicelist:
+            try:
+                filename = series.file[slicelist[sl], time, echo]
+                pixels   = series.pixels[slicelist[sl], time, echo]
+
+                # DICOM fields are all even-length, so offset should
+                # be even number by definition.  But we should check,
+                # because memmap won't work if the offset isn't a
+                # multiple of the element length (here, 2).
+
+                # so use elegant memmap if even:
+                if (pixels[0] % 2) == 0:
+                    try:
+                        mm = memmap(filename, mode='r', 
+                                dtype=(series.end[slicelist[sl],time,echo]+'i2'),
+                                shape=(pixels[1]/2,),
+                                offset=pixels[0])
+                    except:
+                        if options.errorverb:
+                            puts(firstnl + \
+                                 "Warning: unreadable DICOM slice=%s, time=%s, echo=%d\n" % 
+                                 (slicelist[sl], time, echo))
+                            puts("         file " + filename + "\n")
+                            firstnl = ""
+                        raise VolumeError()
+
+
+                # and brute-force unpack otherwise:
+                else:
+                    fh = file(filename, 'rb')
+                    fh.seek(pixels[0])
+                    data = fh.read(pixels[1])
+                    mm = struct.unpack(
+                            series.end[slicelist[sl],time,echo]+'H'*(pixels[1]/2),
+                            data)
+                    fh.close()
+
+                m = series.mosaic[slicelist[sl], time, echo]
+                if m != None:
+                    grid = reshape(mm, (m.mcols, m.mrows), order='F')
+                    grid2 = grid[(m.cpos * dim[0]):((m.cpos+1) * dim[0]),
+                            (m.rpos * dim[1]):((m.rpos+1) * dim[1])]
+
+                    # print m.n, m.cpos, m.rpos
+                    # print shape(rawdata2)
+                    # print shape(rawdata)
+                    # print shape(grid2)
+                    # print shape(grid)
+                    rawdata[:] = reshape(grid2, (dim[0]*dim[1],), order='F')
+                else:
+                    rawdata[:] = mm[:]
+
+                if series.rescale[slicelist[sl], time, echo] == (0.0, 1.0) \
+                        or self.options.rescale == "n":
+                    pass
+
+                else:
+                    scl = series.rescale[slicelist[sl], time, echo]
+                    rawdata = rawdata * scl[1] + scl[0]
+
+                    if self.options.rescale == 'i':
+                        rawdata = rawdata.astype('Int16')
+
+                    elif self.options.rescale == 'f':
+                        pass
+                
+                linear[:,n] = rawdata
+
+                del mm
+                # fh.close()
+
+            except KeyError:
+                if options.errorverb:
+                    puts(firstnl + "Warning: missing file with slice=%s, time=%s, echo=%d\n" % 
+                         (slicelist[sl], time, echo))
+                    firstnl = ""
+                if options.missing:
+                    if options.errorverb:
+                        puts("         you said --missing, so I'll continue; this slice will be zero.\n")
+                    gaps += 1
+                else:
+                    raise VolumeError()
+
+            except struct.error:
+                if options.errorverb:
+                    puts(firstnl+"Warning: Expected and actual data sizes don't match in read\n")
+                    puts("         slice=%g, time=%g, echo=%d, filename=%s\n" % (float(sl), float(time), echo, filename))
+                    firstnl = ""
+                if options.missing:
+                    if options.errorverb:
+                        puts("         You said --missing, so I'll continue; this slice will be zero.\n")
+                    gaps += 1
+                    pass
+                else:
+                    raise VolumeError()
+
+            n += 1
+
+        # decide on filename (several possible options)
+        description = tidy_protoname(series.desc)
+
+        this_template = self.options.name_template
+            
+        if self.options.alias and self.alias.match(studyno, studyname, sno):
+            alias, count = self.alias.match(studyno, studyname, sno)
+            if self.options.name_template == True:
+                this_template = self.alias.template(studyno, studyname, sno)
+        else:
+            alias = "unmatched"
+            count = None
+
+        def expand_template(template):
+            filename = template
+
+            multi = {
+                    'study': len(self.studies) > 1,
+                    't':     len(numerictimelist) > 1,
+                    'echo':  len(series.echoes) > 1,
+                    'count': not (count is None),
+                    }
+
+            repl_table = {
+                    'date': series.date,
+                    'desc': description,
+                    'type': series.imtype,
+                    't':  "%04d" % (int(tp),),
+                    'echo': "%04d" % (echo,),
+                    'ser': fixser(sno),
+                    'n': "%04d" % (simplenumber,),
+                    'study': study[0],
+                    'alias': alias,
+                    'count': str(count),
+                    }
+
+
+            for k in repl_table.keys():
+            
+                def repl(m):
+                    return m.group(1) + repl_table[k] + m.group(2)
+
+                pat = r'%\(([-_]?)' + k + '([-_]?)\)'
+                filename, n = re.subn(pat, repl, filename)
+
+                if multi.has_key(k):
+                    pat = r'\?\(([-_]?)' + k + '([-_]?)\)'
+                    if multi[k]:
+                        filename, n = re.subn(pat, repl, filename)
+                    else:
+                        filename, n = re.subn(pat, '', filename)
+
+            return filename
+
+        if self.options.name_template:
+            filename = expand_template(this_template)
+
+        elif self.options.simpname:
+            filename = "%04d" % (simplenumber,)
+
+        elif self.options.descname or self.options.desctype or self.options.descdated:
+
+            if self.options.desctype or self.options.descdated:
+                description = description + "-" + series.imtype
+
+            name = "%s-%s" % (fixser(sno), description,)
+
+            if self.options.descdated:
+                name = "%s-%s-" % (series.date, study[0], ) + name
+
+            elif len(self.studies) > 1:
+                name = ("%01d-" % (self.studies.keys().index(study),)) + name
+
+            if len(numerictimelist) > 1:
+                name = name + ("-%04d" % (int(tp),))
+
+            if len(series.echoes) > 1:
+                name = name + ("-%04d" % (echo,))
+
+            filename = name
+
+        elif self.options.numname:
+            filename = "%s-%04d-%s-%04d" % \
+                    (studyno, fixser(sno), int(tp), int(echo),) 
+        
+        if self.options.gipl:
+            ext = ".gipl"
+        else:
+            ext = ".nii"
+
+        if self.options.gzip:
+            ext += ".gz"
+
+        # create a symlink first, if needed
+        if self.options.symlink and self.alias.match(studyno, studyname, sno):
+            symlink = options.outprefix + expand_template(
+                        self.alias.template(studyno, studyname, sno)) + ext
+            if os.path.lexists(symlink):
+                os.remove(symlink)
+            os.symlink(filename + ext, symlink)
+
+        filename = self.options.outprefix + filename + ext
+        self.filenames[studyno,studyname,sno] = filename
+        
+        # create, populate, and execute writer
+       #writer = pgipl.GiplFile(filename, "w")
+       #writer.data = arr
+       #writer.IS = (dim[2], dim[1], dim[0], 1)
+       #writer.VS = (series.res[2], series.res[1], series.res[0], 1.0)
+       #writer.DT = pgipl.GiplType.Short
+
+       #if self.options.anonymize:
+       #    writer.DE = self.options.anonymize
+       #else:
+       #    writer.DE = studyname
+
+       #writer.write()
+       #del writer
+
+       #writer = raw.RawWriter(filename)
+       #writer.data = arr
+       #writer.type = NiftiType.UInt16
+       #writer.write()
+       #del writer
+
+        delta = [0.0, 0.0, 0.0]
+        s0 = numericslicelist[0]
+        s0i = slicelist[s0]
+        s0d = series.slicesd[s0i]
+        if len(numericslicelist) > 1:
+            s1 = numericslicelist[1]
+            s1i = slicelist[s1]
+            s1d = series.slicesd[s1i]
+
+            for n in range(0,3):
+                delta[n] = float(s1d[n]) - float(s0d[n])
+        
+        # create orientation data
+        orient = OrientedImage(arr,series.res,series.orient.keys(),s0d,delta)
+
+        # at this point, slice thickness in series.res is taken from
+        # the actual DICOM file; by default (ie unless noslicegap), we
+        # now recalculate it from delta (the actual difference between
+        # the first two slices)
+        if not self.options.noslicegap:
+            orient.useSliceGap()
+
+        if self.options.axial:
+            orient.reOrient("Axial")
+
+        if self.options.origin == "sw":
+            orient.flipV()
+
+        if self.options.origin == "ne":
+            orient.flipH()
+
+        # NB this is the default
+        if self.options.origin == "se":
+            orient.flipV()
+            orient.flipH()
+
+        if self.options.flipv:
+            orient.flipV()
+
+        if self.options.fliph:
+            orient.flipH()
+       
+        # store orientation information
+        self.axes[studyno,studyname,sno] = orient.axes
+
+        # set description if SPM volume label requested
+        if self.options.spmdescrip:
+            descrip = series.descrip[first_slice, time, echo]
+        else:
+            descrip = ""
+        
+        if self.options.gipl:
+            writer = GiplWriter(filename)
+        else:
+            writer = NiiWriter(filename,descrip)
+
+        if self.options.one_padding:
+            writer.set_one_padding(True)
+
+        writer.data = orient.data
+        if self.options.rescale == 'n' or self.options.rescale == 'i':
+            writer.type = NiftiType.Int16
+        else:
+            writer.type = NiftiType.Float32
+        writer.pixdim = orient.pixdim
+
+        if self.options.orient.lower() == 'q':
+            writer.qform = 1 # ie SCANNER_ANAT
+            writer.qfac, writer.qdata = orient.qdata()
+        
+        if self.options.orient.lower() == 's':
+            puts("\nS-form not implemented yet\n")
+            del writer
+            return None
+
+        writer.write()
+        del writer
+
+        return gaps
+
+    def WriteAll(self):
+        n = 1
+        gaps = 0
+        total = self.volumecount()
+        flip = rs = sgl = ""
+        if self.options.flipv: flip+="V"
+        if self.options.fliph: flip+="H"
+        if self.options.axial: rs=", reslicing Axial"
+        if self.options.single: sgl=", single series"
+        if flip == "": flip = "off"
+
+        # build alias table
+        if self.options.alias:
+            unmatched = 0
+
+        puts("Write parameters: %s-form, origin %s, extra flip %s%s%s\n"%
+            (self.options.orient.upper(), self.options.origin.upper(), flip, rs, sgl))
+        
+        if options.single:
+            print "Warning: --single can produce incorrect volumes unless the input data have"
+            print "         consistent (regular, contiguous, non-overlapping) slice positions."
+
+        for study in self.studies:
+            ksort = self.studies[study].keys()[:]
+            ksort.sort(lambda a,b: cmp(fixser(a),fixser(b)))
+            for k in ksort:
+                e = self.studies[study][k]
+
+                # skip if unmatched and not symlinking
+                if self.options.alias and not self.options.symlink and self.alias.match(study[0],study[1],k) is None:
+                    unmatched += 1
+                    continue
+
+                for i in range(0,len(e.times)):
+                    for echo in e.echoes:
+                        if options.missing:
+                            puts ("\rWriting: %s (t=%i, e=%i) (%i/%i) (gaps in %d)      "%(k,i,echo,n,total,gaps))
+                        else:
+                            puts ("\rWriting: %s (t=%i, e=%i) (%i/%i) (skipped %d)      "%(k,i,echo,n,total,gaps))
+
+                        try:
+                            slices_skipped = self.WriteVol(e, study, k, i, echo, n)
+                            if slices_skipped > 0:
+                                gaps += 1
+                        except VolumeError:
+                            gaps += 1
+
+                        n += 1
+
+        if options.missing:
+            puts ("\rWrote: %i/%i (gaps in %d)                          \n"%(n-1,total,gaps))
+        else:
+            puts ("\rWrote: %i/%i (skipped %d)                          \n"%(n-1,total,gaps))
+
+        if options.alias and unmatched > 0:
+            puts ("Ignored volumes not matched by alias: %d\n" % (unmatched))
+
+    def WriteIndexXML(self):
+        fh = open(self.options.outprefix + "index.xml", 'w')
+        fh.write(self.toxml(self.filenames))
+        fh.close()
+    
+    def WriteIndexJSON(self):
+        fh = open(self.options.outprefix + "index.json", 'w')
+        fh.write(self.tojson(filenames=self.filenames,alias=self.alias,axes=self.axes))
+        fh.close()
+
+
+# ----------------------------------------------------------------------
+# Command-line user interface
+#
+
+usage = "%prog [options] <source> [source...]\n\n" + \
+        "Geometry-aware DICOM to Nifti converter\n" + \
+        ("%s\n" % (URL,)) + \
+        "WARNING: use at own risk; check image geometry!\n\n" + \
+        "Options and sources may come in any order.  Sources can be files\n" + \
+        "(mandatory for -D) or directories, which will be searched recursively\n" + \
+        "for DICOM files.  Default output is to current directory (see -o)."
+
+parser = OptionParser(usage=usage)
+
+def deprecated_callback(option, optstr, value, parser):
+    print "Warning: %s is deprecated and will be removed in future" % (option,)
+    print "         (actual argument string was %r)" % (optstr,)
+
+parser.add_option("-n", "--no-write", dest="nowrite", action="store_true",
+        help="just report studies, then quit", default=False)
+
+parser.add_option("-v", "--verbose", dest="errorverb", action="store_true",
+        help="more verbose warnings", default=False)
+
+parser.add_option("-j", "--json", dest="json", action="store_true",
+        help="just print JSON index, then quit", default=False)
+
+parser.add_option("-x", "--xml", dest="xml", action="store_true", 
+        help="just print XML index, then quit", default=False)
+
+def index_callback(option, optstr, value, parser):
+    formats = set(value.split(','))
+    for s in formats:
+        if   s == "json": pass
+        elif s == "xml": pass
+        elif s == "none": pass
+        else: 
+            print "Error: format must be none, json, xml, or both separated by a comma."
+            print "(The format I saw was: %r)" % (s,)
+            exit(-1)
+    parser.values.index = formats
+
+parser.add_option("-I", "--index", dest="index", type="str", default=set(["json"]),
+        action="callback", callback=index_callback, metavar="FMT",
+        help="index type (may be one or more values separated by commas) "+
+        "options are json or xml; default is json")
+
+parser.add_option("-J", "--json-index", dest="jsonindex", action="callback",
+        callback=deprecated_callback,
+        help="write index.json (deprecated; json is now the default, use "+
+        "--index to get XML or both)", default=True)
+
+parser.add_option("-D", "--dump-header", dest="dumpheader",
+        default=False, action="store_true",
+        help="just dump header (of single file), then quit")
+
+parser.add_option("--csa-protocol", dest="dumpprotocol",
+        default=False, action="store_true",
+        help="with -D: dump Siemens protocol metadata")
+
+parser.add_option("--csa-series", dest="dumpseries",
+        default=False, action="store_true",
+        help="with -D: dump Siemens series header")
+
+parser.add_option("--csa-image", dest="dumpimage",
+        default=False, action="store_true",
+        help="with -D: dump Siemens image header")
+
+parser.add_option("--no-trunc", "--csa-full", dest="dumptrunc",
+        default=False, action="store_true",
+        help="with -D: don't truncate DICOM or CSA fields"+
+        " (except CSA MrPhoenixProtocol, which is huge)")
+
+parser.add_option("-u", "--dump-unknown", dest="dumpunknown",
+        default=False, action="store_true",
+        help="dump unknown fields as well", metavar="FILE")
+
+parser.add_option("-p", "--pattern", dest="pattern", default="",
+        help="only read files matching REGEX", metavar="REGEX")
+
+parser.add_option("--fnmatch", dest="fnmatch", default=None,
+        help="only read files matching glob pattern PATTERN (eg */ser1_*.dcm)." +
+        " Pattern only applied against files, not directories (ie all " +
+        "directories are searched, but only matching files are included).",
+        metavar="PATTERN")
+
+parser.add_option("--fnmatch-relative", dest="fnmatch_relative", 
+        default=False,
+        action="store_true",
+        help="match --fnmatch patterns relative to each specified base path, " +
+        "rather than relative to working directory")
+
+
+# shortcut -f for --flat removed (rarely-used standards-breaking option)
+parser.add_option("--flat", dest="flat", action="store_true",
+        help="flatten DICOM tree while reading", default=False)
+
+parser.add_option("--single", dest="single", action="store_true",
+        help="treat everything as a single series (ignore differences "+
+        "in study, patient, and series IDs)", default=False)
+
+parser.add_option("-i", "--include", dest="seqinc", default="",
+        help="only include if description matches REGEX", metavar="REGEX")
+
+parser.add_option("-e", "--exclude", dest="seqexc", default="",
+        help="exclude if description matches REGEX (even if "+
+        "it is also matched by --include)", metavar="REGEX")
+
+parser.add_option("--type-include", dest="typeinc", default="",
+        help="only include if type includes STRING", metavar="STRING")
+
+parser.add_option("--type-exclude", dest="typeexc", default="",
+        help="exclude if type includes STRING (even if "+
+        "it is also matched by --type-include)", metavar="STRING")
+
+parser.add_option("-o", "--output-prefix", dest="outprefix", default="", 
+        help="add PREFIX to front of NIfTI filenames; can contain directories ending "+
+        "in '/' which will be created if necessary; eg '-o dir/pref-'",
+        metavar="PREFIX")
+
+parser.add_option("--gipl", dest="gipl", action="store_true",
+        help="write GIPLs (no orientation stored)", default=False)
+
+parser.add_option("--gzip", dest="gzip", action="store_true",
+        help="use gzip to compress output volumes", default=False)
+
+parser.add_option("-s", "--simple", dest="simpname", action="store_true",
+        help="names: nnnn.nii, simple sequential numering", default=False)
+
+parser.add_option("-f", "--filename", dest="name_template",
+        metavar="TPL", default=None,
+        help="explicit template for volume filenames. %(param) will be "+
+        "expanded for param = date, desc, type ('m', 'p', etc), t "+
+        "(time point), echo, ser, study (id), n (simple counter).  Also "+
+        "?(param) will expand for study, t, echo only when this run includes "+
+        "multiple values.  Use %(-param), ?(-param_) etc to include hyphens "+
+        "and underscores only when param is expanded.")
+
+parser.add_option("-w", "--match", dest="alias", type="str", default=False,
+        metavar="FILE",
+        help="load an alias matching file for automated filtering/naming of output volumes")
+
+parser.add_option("--symlink", dest="symlink", default=False,
+        action="store_true",
+        help="use alias matching file to create symlinks rather than primary names")
+
+parser.add_option("-c", "--desc", dest="descname", action="store_true",
+        help="names: [study-]series-desc[-time][-echo].nii, " +
+        "where desc is the series description", default=False)
+
+parser.add_option("-b", "--number", dest="numname", action="store_true",
+        help="names: study-series-time-echo.nii", default=False)
+
+parser.add_option("-t", "--desc-type", dest="desctype", action="store_true",
+        help="names: [study-]series-desc-type[-time][-echo].nii, " +
+        "where 'type' is the modality-specific type", default=False)
+
+parser.add_option("-d", "--desc-dated", dest="descdated", action="store_true",
+        help="names: date-study-series-desc-type[-time][-echo].nii, " +
+        "using the actual study date and (long) identifier", default=False)
+
+parser.add_option("--n-subseries", dest="nsubseries", action="store_true",
+        help="label subseries z0000 onwards rather than trying axi, "
+        "cor, sag, obl, a, b, c, ... as default", default=False)
+
+parser.add_option("-a", "--anonymize", dest="anonymize",
+        default=None, type="string",
+        help="replace name with NAME in index.json, and exclude "+
+        "example DICOM paths (which could contain patient name). "+
+        "The patient name is never put in the nifti desc field, "+
+        "regardless of the setting of this flag; only the index is "+
+        "affected.", metavar="NAME")
+
+parser.add_option("--one-padding", dest="one_padding", default=False,
+        action="store_true",
+        help="pad dim[] and pixdim[] with ones instead of zeros "+
+        "for elements with indixes greater than dim[0] "+
+        "(some Nifti readers are incorrectly fussy about this)")
+
+parser.add_option("-E", "--force-exdcm", dest="exdcmforce",
+        action="store_true", default=False,
+        help="force exdcm field in index even"+
+        " when using -a (usually omitted when anonymizing)")
+
+parser.add_option("-F", "--full-exdcm", dest="exdcmpath",
+        action="store_true", default=False,
+        help="give full relative path to exdcm in index" +
+        " (warning: path might include patient name)")
+
+parser.add_option("-m", "--missing", dest="missing", action="store_true",
+        help="zero any missing (but logically required) slices", default=False)
+
+parser.add_option("--debug", dest="debug", action="store_true",
+        help="write debugging output of parsed tree and exit", default=False)
+
+parser.add_option("-O", "--orient", dest="orient", default="q", metavar="ORIENT",
+        help="orientation method: a=analyze, q=qform [def]")
+
+parser.add_option("-X", "--mixed", dest="mergeorient",
+        action="store_true", default=False,
+        help="allow mixed-orientation volumes"+
+        " instead of splitting into sub-series 1a, 1b etc.")
+
+parser.add_option("-A", "--slice-axial", dest="axial", action="store_true",
+        help="re-slice to ~axial in-plane (before flip)", default=False)
+
+parser.add_option("-r", "--origin", dest="origin", default="se", metavar="CORNER",
+        help="set origin (nw/ne/sw/se): DICOM=nw, default=se " + 
+        "which is equivalent to -VH; note [-r -V -H] are cumulative")
+
+parser.add_option("-V", "--flip-v", dest="flipv", action="store_true",
+        help="flip vertically, keeping axes locked to data", default=False)
+
+parser.add_option("-H", "--flip-h", dest="fliph", action="store_true",
+        help="flip horizontally, keeping axes locked to data", default=False)
+
+parser.add_option("-g", "--no-slice-gap", dest="noslicegap", action="store_true",
+        help="use slice thickness for 3D voxel size", default=False)
+
+parser.add_option("-R", "--rescale", dest="rescale", default="n", metavar="TYPE",
+        help="rescale: n=no (def), i=int16 (coerce), f=float32")
+
+parser.add_option("-M", "--csa", "--mosaic", dest="csa", action="store_true",
+        help="parse CSA to detect mosaics and find B vectors/values:" +
+        " definitive, but slower" +
+        " (without -M, mosiacs detected from 0008,0008, and diffusion" +
+        " from 0019,100[cde])")
+
+parser.add_option("--mosaic-size", dest="mosaic", type="int",
+        metavar="N", 
+        help="force images to be read as mosaics with N images in each" +
+        " slice (grid size is calculated automatically)")
+
+parser.add_option("--acr", dest="acr", action="store_true",
+        help="try and guess whether files are ACR-NEMA 2.0 format" +
+        " (implicit without preamble) as well as detecting DICOM")
+
+parser.add_option("--slice-1d", dest="slice3d", action="store_false", default=False,
+        help="deduce stacking from Slice Location; preserves specified" +
+        " stacking order which may be opposite to DICOM right-handed k"+
+        " (currently the default behaviour, but --slice-3d is often preferred)")
+
+parser.add_option("--slice-3d", dest="slice3d", action="store_true", default=False,
+        help="deduce stacking by projecting Image Position (Patient) along DICOM "+
+        " right-handed k; necessary for" +
+        " some Siemens DIS2D/DIS3D output with incongruous values"+
+        " (may replace --slice-1d as the default behaviour in future)")
+
+parser.add_option("--slice-inst", dest="sliceinst", action="store_true", default=False,
+        help="ignore any slice position/orientation and force stacking by instance"+
+        " number instead; use to force complex non-volumetric data, eg rotating or"+
+        " projected slices, into a stack")
+
+parser.add_option("--stack-unk", dest="stackunk", action="store_true", default=False,
+        help="equivalent to --slice-inst for data where"+
+        " geometric fields are unknown; otherwise, such slices"+
+        " are ignored")
+
+parser.add_option("--no-round", dest="roundorient",
+        default=True, action="store_false",
+        help="do not try to identify near-identical slice orientations"+
+        " to merge; instead, split them into separate series")
+
+parser.add_option("--round-threshold", dest="roundorientthresh",
+        default=0.001, type="float", metavar="DEGREES",
+        help="set threshold for merging near-identical orientations within a "+
+        "single series to less than DEGREES for either angle (default 0.001)")
+
+parser.add_option("--sar", dest="sar", action="store_true", default=False,
+        help="extract Siemens SAR values into index (requires parsing "+
+        "CSA headers, so runs a little slower)")
+
+parser.add_option("--phase", dest="phase", action="store_true", default=False,
+        help="extract phase axis and Siemens phase direction flag "+
+        "(requires parsing CSA headers, so runs a little slower)")
+
+parser.add_option("--spm-descrip", dest="spmdescrip", action="store_true", default=False,
+        help="write SPM-style MRI parameter comment in descrip field")
+
+def version_callback(a,b,c,d):
+       
+    print "volconv - geometry-aware DICOM to Nifti converter"
+    print "%s" % (URL,)
+    print ""
+    print "Release: " + RELEASE
+
+    srcdir = os.path.dirname(os.path.dirname(pydcm.__file__))
+    os.chdir(srcdir)
+
+    def call(arr):
+        return subprocess.Popen(arr,
+                stderr=subprocess.PIPE,stdout=subprocess.PIPE).communicate()[0]
+
+    try:
+        hgdir = os.path.join(srcdir,".hg")
+        if not os.path.isdir(hgdir):
+            raise "Not HG directory"
+        hg_version = call(["hg","id"]).rstrip("\n")
+        print "Repository ID: " + hg_version
+
+    except:
+        pass
+
+    try:
+        archfile = os.path.join(srcdir,".hg_archival.txt")
+        if not os.path.isfile(archfile):
+            raise "No archive file"
+
+        fh = file(archfile,"r")
+        arch = {}
+        for line in fh.readlines():
+            key, value = line.rstrip("\r\n").split(": ")
+            arch[key] = value
+        fh.close()
+        if "tag" in arch:
+            tag = arch["tag"]
+        elif "latesttag" and "latesttagdistance" in arch:
+            tag = "%s commits after %s" % (
+                    arch["latesttagdistance"],
+                    arch["latesttag"],)
+        else:
+            tag = "changeset %s" (
+                    arch["node"],
+                    )
+        print "Archive ID: " + tag
+    except:
+        pass
+
+    exit(0)
+
+parser.add_option("--version", action="callback",
+        callback=version_callback,
+        help="print version control hash, if available")
+
+# -- proposed new options below this line --
+
+# parser.add_option("-t", "--concat-time", dest="origin_sw", action="store_true",
+#                   help="concatenate timeseries into single 4D vol", default=False)
+# 
+# parser.add_option("-C", "--slice-coronal", dest="coronal", action="store_true",
+#                   help="re-orient nearest to coronal in-plane", default=False)
+# parser.add_option("-S", "--slice-sagittal", dest="sagittal", action="store_true",
+#                   help="re-orient nearest to coronal in-plane", default=False)
+
+if len(sys.argv) == 1:
+    sys.argv.append("-h")
+
+(options, args) = parser.parse_args()
+if len(args) == 0:
+    print "Error: you must give volconv the path to at least one DICOM file"
+    print "or directory to recurse looking for DICOM files.  Say 'volconv .'"
+    print "to start in the current directory."
+    exit(-1)
+
+source = args[0]
+
+if options.symlink and not options.alias:
+    print "Error: --symlink only makes sense with -w/--match."
+    exit(-1)
+
+nnames = options.numname + options.descname + options.simpname + options.desctype + options.descdated + bool(options.name_template)
+if nnames == 0:
+    if options.alias and not options.symlink:
+        options.name_template = True
+    else:
+        options.descname = True
+elif nnames > 1:
+    print "Error: please only specify one of -f, -s, -c, -m, -t, and -d (or none"
+    print "for the current default of -c for descriptive names)"
+    exit(-1)
+
+if options.rescale != "n" and options.rescale != "i" and options.rescale != "f":
+    print "Please specify one of n, i, or f to the -R/--rescale option"
+    exit(-1)
+
+if options.dumpheader and source:
+    reader = DicomReader(source, options.flat, acr=options.acr)
+    reader.readHeader()
+
+    trunc = not options.dumptrunc
+
+    if options.dumpprotocol:
+        print reader.getCSA('series','MrPhoenixProtocol')[0]
+    elif options.dumpseries:
+        reader.dumpCSAtype('series',trunc)
+    elif options.dumpimage:
+        reader.dumpCSAtype('image',trunc)
+    else:
+        reader.dump(options.dumpunknown,trunc)
+
+elif options.dumpheader and source:
+    reader = DicomReader(source, options.flat)
+    reader.readHeader()
+    reader.dump(options.dumpunknown)
+
+else:
+    DicomConverter(options,args).Execute()
+
+# vim:sw=4:sts=4
