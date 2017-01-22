@@ -14,7 +14,7 @@ at several institutions - it includes work done in collaboration with:
   - UCLH NHS Foundation Trust
 
 This tool has existed since 2006, with version 1.0.0 released in 2017.
-Release numbers use semantic versioning - see http://semver.org/.
+Release numbers use semantic versioning - see <http://semver.org/>.
 
 Redistibution
 -------------
@@ -41,7 +41,11 @@ for medical use.
 Installation and usage
 ----------------------
 
-See USAGE.md for installation and usage instructions. 
+See 
+[USAGE.md](https://bitbucket.org/mjwhite/volconv/src/default/USAGE.md)
+for installation and usage instructions.  A summary of release history
+can be found in 
+[CHANGES.md](https://bitbucket.org/mjwhite/volconv/src/default/CHANGES.md).
 
 You can always see a full, up-to-date list of options (including any
 recently-added features not yet in the documentation) by running:
@@ -51,4 +55,5 @@ recently-added features not yet in the documentation) by running:
 Per the licence terms noted above, volconv comes with no promise of
 support. But at the time of writing it remains under active
 developent: bug reports, feature requests, and de-identified DICOM
-input examples are welcome to <mark@celos.net>.
+input examples are welcome to <mark@celos.net> or in the repository's
+issue tracker.
