@@ -2,7 +2,7 @@ Volconv
 Available from: https://bitbucket.org/mjwhite/volconv
 Under: Apache Licence v2 (http://www.apache.org/licenses/)
 
-  Copyright (c) 2006-2016 Mark J White <mark@celos.net>
+  Copyright (c) 2006-2017 Mark J White <mark@celos.net>
 
 Includes code from GDCM
 Available from: https://www.creatis.insa-lyon.fr/software/public/Gdcm/
