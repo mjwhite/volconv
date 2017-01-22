@@ -698,7 +698,8 @@ parser.add_option("-a", "--anonymize", dest="anonymize",
 parser.add_option("--one-padding", dest="one_padding", default=False,
         action="store_true",
         help="pad dim[] and pixdim[] with ones instead of zeros "+
-        "for elements with indixes greater than dim[0] "+
+        "for elements with indixes greater than dim[0], and set "+
+        "scl_slope to one instead of zero "+
         "(some Nifti readers are incorrectly fussy about this)")
 
 parser.add_option("-E", "--force-exdcm", dest="exdcmforce",

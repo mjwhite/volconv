@@ -3,7 +3,7 @@
 # Volconv - geometry-aware DICOM-to-NIfTI converter
 # NIfTI module
 #
-# Copyright 2006-2016 Mark J White <mark@celos.net>
+# Copyright 2006-2017 Mark J White <mark@celos.net>
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -89,6 +89,11 @@ class NiiWriter(RawWriter):
             self.writeVal(80,  'f',  7, self.pixdim)
 
         self.writeVal(108, 'f',  7, (352.0,)) # vox_offset
+
+        if self.one_padding:
+            self.writeVal(112, 'f',  1, (1.0,)) # scl_slope
+            self.writeVal(116, 'f',  1, (0.0,)) # scl_inter
+
         self.writeVal(123, 'b',  1, (10,)) # xyzt_units: 10 = mm + sec
 
         self.writeVal(344, 'c',  4, "n+1\x00") # magic
