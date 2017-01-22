@@ -34,7 +34,7 @@ import re
 import subprocess
 import inspect
 
-from optparse import OptionParser
+from optparse import OptionParser, SUPPRESS_HELP
 
 ver = map(int, string.split(
     re.sub(r'rc\d+$','',string.split(sys.version)[0]),"."))
@@ -536,9 +536,16 @@ usage = "%prog [options] <source> [source...]\n\n" + \
 
 parser = OptionParser(usage=usage)
 
-def deprecated_callback(option, optstr, value, parser):
-    print "Warning: %s is deprecated and will be removed in future" % (option,)
-    print "         (actual argument string was %r)" % (optstr,)
+def make_deprecation_callback(message, fail=False):
+    def callback(option, optstr, value, parser):
+        if fail:
+            print "Error: %s has been removed, volconv will stop " % (option,)
+        else:
+            print "Warning: %s is deprecated and will be removed in future" % (option,)
+        print "    " + message
+        if fail:
+            exit(-1)
+    return callback
 
 parser.add_option("-n", "--no-write", dest="nowrite", action="store_true",
         help="just report studies, then quit", default=False)
@@ -569,10 +576,9 @@ parser.add_option("-I", "--index", dest="index", type="str", default=set(["json"
         help="index type (may be one or more values separated by commas) "+
         "options are json or xml; default is json")
 
-parser.add_option("-J", "--json-index", dest="jsonindex", action="callback",
-        callback=deprecated_callback,
-        help="write index.json (deprecated; json is now the default, use "+
-        "--index to get XML or both)", default=True)
+parser.add_option("-J", "--prefer-json", dest="preferjson",
+        default=False, action="store_true",
+        help="prefer JSON for console output (changes behaviour of -D)")
 
 parser.add_option("-D", "--dump-header", dest="dumpheader",
         default=False, action="store_true",
@@ -857,6 +863,14 @@ parser.add_option("--version", action="callback",
         callback=version_callback,
         help="print version control hash, if available")
 
+# -- deprecated options --
+parser.add_option("--json-index",
+        action="callback",
+        callback=make_deprecation_callback(
+            "JSON indices are the default behaviour anyway",
+            False),
+        help=SUPPRESS_HELP)
+
 # -- proposed new options below this line --
 
 # parser.add_option("-t", "--concat-time", dest="origin_sw", action="store_true",
@@ -905,18 +919,17 @@ if options.dumpheader and source:
     trunc = not options.dumptrunc
 
     if options.dumpprotocol:
-        print reader.getCSA('series','MrPhoenixProtocol')[0]
+        if options.preferjson:
+            print 'Error: cannot dump MrPhoenixProtocol as JSON yet'
+            exit(-1)
+        else:
+            print reader.getCSA('series','MrPhoenixProtocol')[0]
     elif options.dumpseries:
-        reader.dumpCSAtype('series',trunc)
+        reader.dumpCSAtype('series',trunc,json=options.preferjson)
     elif options.dumpimage:
-        reader.dumpCSAtype('image',trunc)
+        reader.dumpCSAtype('image',trunc,json=options.preferjson)
     else:
-        reader.dump(options.dumpunknown,trunc)
-
-elif options.dumpheader and source:
-    reader = DicomReader(source, options.flat)
-    reader.readHeader()
-    reader.dump(options.dumpunknown)
+        reader.dump(options.dumpunknown,trunc,json=options.preferjson)
 
 else:
     DicomConverter(options,args).Execute()

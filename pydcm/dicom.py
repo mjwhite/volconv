@@ -164,6 +164,34 @@ def alpha_ser(n):
 def z_ser(n):
     return 'z%04d' % (n,)
 
+def string_escape_json(v):
+    new = ""
+    for c in v:
+        if c in ["\\", "\/", "\""]:
+            new += '\\' + c
+        elif c in ["\b", "\f", "\n", "\r", "\t"]:
+            new += repr(c)[1:3]
+        elif c in string.punctuation or \
+                c in string.letters or \
+                c in string.digits or \
+                c in [" "]:
+            new += c
+        else:
+            new += '\u%04x' % (ord(c),)
+    return new
+
+def value_to_json(v):
+    if type(v) == str:
+        return '"%s"' % string_escape_json(v)
+    elif type(v) == int:
+        return '%d' % v
+    elif type(v) == float:
+        return '%f' % v
+    elif type(v) == tuple:
+        return '[' + ", ".join([value_to_json(e) for e in v]) + ']'
+    else:
+        raise "Unhandled value during JSON conversion"
+
 class CSA:
     def __init__(self, d):
         self.d = d
@@ -311,9 +339,12 @@ class DicomReader:
     def printin(self,str):
         sys.stdout.write (self.level * "    " + str)
 
-    def dump(self, unknown=True, trunc=True):
-        self.dumpTree(self.vals, unknown, trunc)
-
+    def dump(self, unknown=True, trunc=True, json=False):
+        if json:
+            self.dumpJSON(self.vals, unknown)
+        else:
+            self.dumpTree(self.vals, unknown, trunc)
+    
     def getCSA(self, type, key):
         try:
             csa = self.csadata[type]
@@ -341,14 +372,33 @@ class DicomReader:
                 value = value[0:60] + " ..."
             self.printin(": %s = %s\n" % (k, value,))
 
-    def dumpCSAtype(self,type,trunc=1):
+    def dumpCSAasJSON(self,csa):
+        buf = []
+        buf.append('{')
+
+        for i, k in enumerate(csa.keys()):
+            if i > 0: buf[-1] += ','
+            v = [v["val"].replace("\n"," ") for v in csa[k]["items"] if v["subhdr"][0] > 0]
+            v = [value_to_json(e) for e in v]
+            value = "[" + ", ".join(v) + "]"
+            if k == "MrPhoenixProtocol":
+                value = '["MrPhoenixProtocol"]'
+            buf.append('    "%s": %s' % (k, value))
+
+        buf.append('}')
+        sys.stdout.write(("\n".join(buf)) + "\n")
+
+    def dumpCSAtype(self,type,trunc=1,json=False):
         if type == "image":
             csa = self.convertCSA2(self.vals[(0x0029,0x1010)].d)
-            self.dumpCSA(csa,trunc)
         elif type == "series":
             csa = self.convertCSA2(self.vals[(0x0029,0x1020)].d)
+            
+        if json:
+            self.dumpCSAasJSON(csa)
+        else:
             self.dumpCSA(csa,trunc)
-
+    
     def dumpTree(self, tree, unknown=True, trunc=True):
         keys = tree.keys()
         keys.sort()
@@ -377,6 +427,44 @@ class DicomReader:
                 else:
                     self.printin("%04x|%04x %036s : %s \n" %
                             (k[0], k[1], name, "%r %s" % (tree[k], type(tree[k]))))
+
+    def dumpJSON(self, tree, unknown=True, child=False):
+        keys = tree.keys()
+        keys.sort()
+
+        buf = []
+
+        buf.append("{")
+
+        for i,k in enumerate(keys):
+            if k in self.dict.name:
+                name = self.dict.shortname[k]
+            else:
+                if not unknown: continue
+                name = "unknown"
+
+            if isinstance(tree[k],CSA):
+                pass
+
+            elif isinstance(tree[k],dict):
+                if i > 0: buf[-1] += ','
+                sub = self.dumpJSON(tree[k],unknown,child=True)
+                sub = ['        '+e for e in sub]
+                buf.append('    "%04x|%04x": {"name": "%s", "value":' %
+                        (k[0], k[1], name))
+                buf.extend(sub)
+                buf.append('    }')
+
+            else:
+                if i > 0: buf[-1] += ','
+                buf.append('    "%04x|%04x": {"name": "%s", "value": %s}' %
+                        (k[0], k[1], name, value_to_json(tree[k])))
+
+        buf.append("}")
+        if child:
+            return buf
+        else:
+            sys.stdout.write(("\n".join(buf)) + "\n")
 
     def convertCSA2(self, str):
         csa = {}
