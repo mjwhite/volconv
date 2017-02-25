@@ -20,7 +20,7 @@
 # See COPYING.txt and NOTICE.txt in the distribution for details.
 # 
 
-RELEASE = "1.0.0"
+RELEASE = "1.1.1"
 URL     = "https://bitbucket.org/mjwhite/volconv"
 
 from numpy import *
