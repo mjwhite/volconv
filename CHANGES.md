@@ -9,6 +9,14 @@ Release numbers user Semantic Versioning, <http://semver.org/>.
 Next release
 ------------
 
+1.1.1 (2017-02-25)
+------------------
+
+  - Correct printed version number.
+
+1.1.0 (2017-01-26)
+------------------
+
   - Set `scl_slope` to 1.0 with `--one-padding`; additional feature in
     existing flag which sets makes some unused Nifti fields nonzero.
 
